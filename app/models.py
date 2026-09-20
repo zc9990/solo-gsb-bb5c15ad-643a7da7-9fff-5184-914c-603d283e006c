@@ -162,6 +162,28 @@ class CutEventRequest(BaseModel):
     step: int = Field(..., ge=1, description="刚完成的刀在该母板上的序号")
 
 
+class BatchCutIn(BaseModel):
+    """批次中的一刀：只需定位到刀，几何信息以方案快照为准。"""
+    model_config = ConfigDict(extra="forbid")
+
+    panel_no: int = Field(..., ge=1, description="刀所在母板编号")
+    step: int = Field(..., ge=1, description="刀在该母板上的序号")
+
+
+class CutBatchRequest(BaseModel):
+    """设备离线期间完成的切刀批次：从 base_version 之后的第一刀起按执行顺序排列。"""
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="批次幂等键（会话内唯一）：同键同请求重放首次结果")
+    base_version: int = Field(
+        ..., ge=0,
+        description="设备离线前看到的会话版本；批次第一刀对应该版本之后的第一刀")
+    cuts: list[BatchCutIn] = Field(
+        ..., description="按执行顺序排列的切刀列表（可为空，表示仅对账不推进）")
+
+
 class SessionCutOut(BaseModel):
     """会话视角的一刀（在方案 CutOut 之上附带母板编号）。"""
     panel_no: int
@@ -188,3 +210,11 @@ class SessionResponse(BaseModel):
     created_at: str
     updated_at: str
     completed_at: Optional[str]
+
+
+class CutBatchResponse(BaseModel):
+    """批次对账/推进结果 + 最新会话状态。"""
+    skipped: int = Field(
+        ..., description="对账一致而跳过的刀数（base_version 之后服务端已完成）")
+    applied: int = Field(..., description="本批次实际推进的刀数")
+    session: SessionResponse = Field(..., description="推进后的最新会话状态")

@@ -11,7 +11,8 @@
 - 保证：零件不重叠、不越界；锯缝实际占位；同输入稳定（确定性算法 + 幂等存储）；
   排不下的零件以明确原因列出；G-code 导出前逐刀几何校验，异常方案整体拒绝；
   切割执行会话持久化，逐刀事件以乐观锁版本 + 幂等键在 SQLite 事务中校验，
-  并发与重试不会破坏执行状态。
+  并发与重试不会破坏执行状态；设备离线期间完成的切刀可按批次回传，
+  服务端在单事务中对账（一致前缀仅跳过、其余连续匹配后一次性推进）。
 
 ---
 
@@ -361,6 +362,72 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/events \
 `detail.error` 取值：`version_conflict` / `cut_mismatch` /
 `session_completed` / `idempotency_key_reuse`。
 
+### `POST /api/v1/sessions/{session_id}/event-batches` — 离线回传切刀批次
+
+设备离线期间完成的刀，恢复联网后按**执行顺序**整批回传。请求体：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `batch_id` | string, 1~128 字符 | 批次幂等键（会话内唯一） |
+| `base_version` | int, ≥0 | 设备离线前看到的会话版本；批次第一刀对应该版本之后的第一刀 |
+| `cuts` | array（可为空） | 按执行顺序排列的切刀列表，每项 `{panel_no, step}` |
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/event-batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batch_id": "offline-2026-09-20-001",
+    "base_version": 2,
+    "cuts": [
+      {"panel_no": 1, "step": 3},
+      {"panel_no": 1, "step": 4},
+      {"panel_no": 1, "step": 5}
+    ]
+  }'
+```
+
+服务端在**单个 SQLite 写事务（`BEGIN IMMEDIATE`）**内依次执行：查批次幂等
+记录 → 校验 `base_version` 不超过当前版本 → 把 `base_version` 之后服务端
+**已完成的区间与批次前缀逐项对账**（一致前缀仅跳过；首个不一致整批拒绝）
+→ 其余后缀必须**连续匹配当前方案**的下一刀序列 → 验证通过后一次性推进
+`version` 与 `completed_cuts` 并记录批次，然后一次性提交。由此保证：
+
+- **对账跳过**：离线期间服务端已通过单刀事件（或先前批次）推进的区间，
+  与批次前缀一致的部分只跳过不重复推进；
+- **整批原子**：前缀对账或后缀匹配任一失败 → `409 batch_mismatch`，
+  整批不推进（`detail` 含 `phase`=`reconcile`/`apply`、批次内下标 `index`
+  及 `expected`/`received`）；`base_version` 比服务端还新 →
+  `409 version_conflict`；
+- **幂等重放**：同一 `batch_id` + 相同请求体重试，返回首次应用的原始响应
+  （HTTP `200`，逐字段一致），状态不重复推进；同键不同请求 →
+  `409 batch_id_reuse`；
+- **并发安全**：批次与单刀、批次与批次在库级串行，后到者基于最新状态重新
+  对账——已被覆盖的批次自然转为“全部跳过”，不会重复推进。
+
+成功返回 `skipped`/`applied` 数量及最新会话状态：
+
+```jsonc
+{
+  "skipped": 1,                  // 对账一致而跳过的刀数
+  "applied": 2,                  // 本批次实际推进的刀数
+  "session": {                   // 推进后的最新会话状态（SessionResponse）
+    "session_id": "3f8c…",
+    "status": "active",
+    "version": 5,
+    "completed_cuts": 5,
+    "total_cuts": 20,
+    "current_panel": 1,
+    "next_cut": {"panel_no": 1, "step": 6, "axis": "H", "…": "…"},
+    "created_at": "2026-09-20T08:00:00Z",
+    "updated_at": "2026-09-20T09:30:00Z",
+    "completed_at": null
+  }
+}
+```
+
+`detail.error` 取值：`batch_mismatch` / `version_conflict` /
+`batch_id_reuse`；会话不存在返回 `404`。
+
 ### `GET /health`
 
 返回 `{"status":"ok"}`，供容器健康检查与负载均衡探活。
@@ -408,10 +475,10 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/events \
 │   ├── models.py        # 请求/响应 Pydantic 模型与参数校验
 │   ├── nesting.py       # 直切排样核心算法 + 几何自检 + 响应装配
 │   ├── gcode.py         # G-code 导出：坐标变换、导出前校验、确定性文本生成
-│   ├── services.py      # 业务编排、幂等落库、切割会话推进（事务校验）
+│   ├── services.py      # 业务编排、幂等落库、切割会话推进（事件/批次事务校验）
 │   ├── database.py      # SQLite 连接、建表、plan_id 摘要、方案/会话 CRUD、写事务
 │   └── init_db.py       # python -m app.init_db 建库入口
-├── tests/               # unittest：核心算法/随机不变量/持久化幂等/G-code/会话并发/API 端到端
+├── tests/               # unittest：核心算法/随机不变量/持久化幂等/G-code/会话与批次并发/API 端到端
 ├── entrypoint.sh        # 容器启动：建库 + uvicorn（一条命令）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -430,4 +497,6 @@ python3 -m unittest discover -s tests -v
 结果稳定性（含输入乱序）、SQLite 幂等存取、**G-code 坐标变换/确定性/行号映射/
 总长/导出前校验**、**切割会话的启动/查询/逐刀推进/零切割即完成、幂等重试原样
 返回、同键冲突、旧版本与跳步拒绝、多线程并发竞争（同版本唯一胜者、同键全员
-重放、带重试跑完整个会话）**，以及基于 TestClient 的 HTTP 端到端。
+重放、带重试跑完整个会话）**、**离线批次的对账跳过/整批原子拒绝/空批次同步/
+完成后重传、批次幂等重放与同键冲突、重叠批次并发合成、批次与单刀混合并发
+跑完整个会话**，以及基于 TestClient 的 HTTP 端到端。

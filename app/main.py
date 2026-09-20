@@ -9,6 +9,8 @@
   POST /api/v1/plans/{plan_id}/sessions       从方案启动切割执行会话
   GET  /api/v1/sessions/{session_id}          查询切割会话状态
   POST /api/v1/sessions/{session_id}/events   提交“完成当前刀”事件（幂等）
+  POST /api/v1/sessions/{session_id}/event-batches
+                                              离线回传切刀批次（对账 + 幂等）
 """
 from __future__ import annotations
 
@@ -19,6 +21,8 @@ from fastapi.responses import JSONResponse
 
 from . import database as db
 from .models import (
+    CutBatchRequest,
+    CutBatchResponse,
     CutEventRequest,
     GcodeRequest,
     GcodeResponse,
@@ -36,6 +40,7 @@ from .services import (
     export_gcode,
     get_session_state,
     start_session,
+    submit_cut_batch,
     submit_cut_event,
 )
 
@@ -55,9 +60,11 @@ app = FastAPI(
         "相同输入返回稳定且幂等的结果。"
         "支持从已保存方案启动持久化的切割执行会话：按 panel_no/step 顺序"
         "逐刀汇报进度，乐观锁版本 + 幂等键在 SQLite 事务中校验，"
-        "并发与重试不会破坏执行状态。"
+        "并发与重试不会破坏执行状态。设备离线期间完成的切刀可按批次回传："
+        "服务端在单事务中将 base_version 之后已完成区间与批次前缀逐项对账，"
+        "一致前缀仅跳过，其余后缀连续匹配当前方案后一次性推进。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -173,6 +180,24 @@ def post_session_event(session_id: str, req: CutEventRequest) -> SessionResponse
         payload = submit_cut_event(session_id, req)
     except SessionConflictError as exc:
         # 版本/当前刀/幂等键冲突或会话已完成：状态未推进
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return JSONResponse(payload)
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/event-batches",
+    response_model=CutBatchResponse,
+    tags=["sessions"],
+    summary="离线回传切刀批次（对账 + 版本/幂等校验，事务推进）",
+)
+def post_session_event_batch(session_id: str,
+                             req: CutBatchRequest) -> CutBatchResponse:
+    try:
+        payload = submit_cut_batch(session_id, req)
+    except SessionConflictError as exc:
+        # 幂等键冲突/基线版本越界/对账或后缀不匹配：整批未推进
         raise HTTPException(status_code=409, detail=exc.detail) from exc
     if payload is None:
         raise HTTPException(status_code=404, detail="会话不存在")

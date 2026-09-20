@@ -3,12 +3,15 @@
 plan_id 由规范化请求 JSON 的 SHA256 派生（与时间无关），相同输入天然幂等：
 重复提交会命中已存在的方案记录并原样返回，保证“相同输入得到稳定结果”。
 
-切割执行会话（cut_sessions / cut_session_events）：
+切割执行会话（cut_sessions / cut_session_events / cut_session_batches）：
 - cut_sessions 记录一次方案执行的进度：version 为乐观锁版本，每完成一刀 +1；
 - cut_session_events 以 (session_id, idempotency_key) 为主键记录已应用事件，
   同一键重试直接重放首次响应，同键不同请求视为冲突；
-- 事件推进走 transaction()（BEGIN IMMEDIATE）：校验与状态推进在同一事务中
-  原子完成，并发写者由 SQLite 写锁串行化，旧版本/跳步请求不会推进状态。
+- cut_session_batches 以 (session_id, batch_id) 为主键记录已应用批次，
+  供设备离线后批量回传：对账一致的前缀仅跳过，其余后缀连续匹配当前方案后
+  一次性推进；同键重试重放首次响应，同键不同请求视为冲突；
+- 事件/批次推进走 transaction()（BEGIN IMMEDIATE）：校验与状态推进在同一
+  事务中原子完成，并发写者由 SQLite 写锁串行化，旧版本/跳步请求不会推进状态。
 """
 from __future__ import annotations
 
@@ -63,6 +66,20 @@ CREATE TABLE IF NOT EXISTS cut_session_events (
     response_json   TEXT NOT NULL,             -- 首次应用的响应，重试原样返回
     created_at      TEXT NOT NULL,
     PRIMARY KEY (session_id, idempotency_key)
+);
+
+-- 切刀批次幂等记录：同一 (session_id, batch_id) 只应用一次
+CREATE TABLE IF NOT EXISTS cut_session_batches (
+    session_id   TEXT NOT NULL REFERENCES cut_sessions(session_id),
+    batch_id     TEXT NOT NULL,
+    base_version INTEGER NOT NULL,           -- 设备离线前看到的会话版本
+    cut_count    INTEGER NOT NULL,           -- 批次内刀数
+    skipped      INTEGER NOT NULL,           -- 对账一致而跳过的刀数
+    applied      INTEGER NOT NULL,           -- 实际推进的刀数
+    request_json  TEXT NOT NULL,             -- 规范化请求（识别同键不同请求）
+    response_json TEXT NOT NULL,             -- 首次应用的响应，重试原样返回
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (session_id, batch_id)
 );
 """
 
@@ -257,5 +274,42 @@ def get_session_event(session_id: str, idempotency_key: str,
 def count_session_events(session_id: str, conn: sqlite3.Connection) -> int:
     return conn.execute(
         "SELECT COUNT(*) AS c FROM cut_session_events WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()["c"]
+
+
+def insert_session_batch(session_id: str, batch_id: str, base_version: int,
+                         cut_count: int, skipped: int, applied: int,
+                         request_json: str, response_json: str,
+                         created_at: str, conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        INSERT INTO cut_session_batches
+          (session_id, batch_id, base_version, cut_count, skipped, applied,
+           request_json, response_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (session_id, batch_id, base_version, cut_count, skipped, applied,
+         request_json, response_json, created_at),
+    )
+
+
+def get_session_batch(session_id: str, batch_id: str,
+                      conn: sqlite3.Connection) -> Optional[dict]:
+    row = conn.execute(
+        """
+        SELECT session_id, batch_id, base_version, cut_count, skipped, applied,
+               request_json, response_json, created_at
+          FROM cut_session_batches
+         WHERE session_id = ? AND batch_id = ?
+        """,
+        (session_id, batch_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def count_session_batches(session_id: str, conn: sqlite3.Connection) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) AS c FROM cut_session_batches WHERE session_id = ?",
         (session_id,),
     ).fetchone()["c"]
