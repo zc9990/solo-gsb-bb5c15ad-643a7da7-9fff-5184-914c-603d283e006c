@@ -173,6 +173,33 @@ class SessionCutOut(BaseModel):
     region: RectOut
 
 
+class BatchCutIn(BaseModel):
+    """离线批次中的一刀：以 (panel_no, step) 标识，按执行顺序排列。"""
+    model_config = ConfigDict(extra="forbid")
+
+    panel_no: int = Field(..., ge=1, description="刀所在母板编号")
+    step: int = Field(..., ge=1, description="刀在该母板上的序号")
+
+
+class EventBatchRequest(BaseModel):
+    """设备离线后回传的批次切割事件。
+
+    base_version 是客户端最后确认的服务端版本；cuts 列出自该版本起
+    按执行顺序切完的刀。服务端将 base_version 之后已完成的区间与批次
+    前缀逐项对账，一致前缀仅跳过，其余后缀必须连续匹配当前方案。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="批次幂等键（会话内唯一）：同键重试返回首次结果")
+    base_version: int = Field(
+        ..., ge=0, description="客户端最后确认的服务端版本（对账起点）")
+    cuts: list[BatchCutIn] = Field(
+        ..., min_length=1,
+        description="自 base_version 起按执行顺序排列的切刀列表")
+
+
 class SessionResponse(BaseModel):
     session_id: str
     plan_id: str
@@ -188,3 +215,12 @@ class SessionResponse(BaseModel):
     created_at: str
     updated_at: str
     completed_at: Optional[str]
+
+
+class EventBatchResponse(BaseModel):
+    """批次对账/推进结果：skipped + applied == 请求中的刀数。"""
+    batch_id: str
+    skipped: int = Field(
+        ..., description="与 base_version 之后已完成区间对账一致而跳过的刀数")
+    applied: int = Field(..., description="本次实际推进的刀数")
+    session: SessionResponse = Field(..., description="推进后的最新会话状态")

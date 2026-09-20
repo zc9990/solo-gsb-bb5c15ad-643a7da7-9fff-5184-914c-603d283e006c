@@ -9,6 +9,8 @@
   POST /api/v1/plans/{plan_id}/sessions       从方案启动切割执行会话
   GET  /api/v1/sessions/{session_id}          查询切割会话状态
   POST /api/v1/sessions/{session_id}/events   提交“完成当前刀”事件（幂等）
+  POST /api/v1/sessions/{session_id}/event-batches
+        设备离线后回传批次切割事件（对账 + 一次性推进，幂等）
 """
 from __future__ import annotations
 
@@ -20,6 +22,8 @@ from fastapi.responses import JSONResponse
 from . import database as db
 from .models import (
     CutEventRequest,
+    EventBatchRequest,
+    EventBatchResponse,
     GcodeRequest,
     GcodeResponse,
     HealthOut,
@@ -37,6 +41,7 @@ from .services import (
     get_session_state,
     start_session,
     submit_cut_event,
+    submit_event_batch,
 )
 
 
@@ -55,9 +60,10 @@ app = FastAPI(
         "相同输入返回稳定且幂等的结果。"
         "支持从已保存方案启动持久化的切割执行会话：按 panel_no/step 顺序"
         "逐刀汇报进度，乐观锁版本 + 幂等键在 SQLite 事务中校验，"
-        "并发与重试不会破坏执行状态。"
+        "并发与重试不会破坏执行状态；设备离线后可通过批次接口一次性回传"
+        "期间切完的刀，服务端在单事务中对账已应用前缀并连续推进后缀。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -173,6 +179,24 @@ def post_session_event(session_id: str, req: CutEventRequest) -> SessionResponse
         payload = submit_cut_event(session_id, req)
     except SessionConflictError as exc:
         # 版本/当前刀/幂等键冲突或会话已完成：状态未推进
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return JSONResponse(payload)
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/event-batches",
+    response_model=EventBatchResponse,
+    tags=["sessions"],
+    summary="设备离线后回传批次切割事件（对账 + 一次性推进）",
+)
+def post_session_event_batch(session_id: str,
+                             req: EventBatchRequest) -> EventBatchResponse:
+    try:
+        payload = submit_event_batch(session_id, req)
+    except SessionConflictError as exc:
+        # 对账不一致/版本冲突/批次号复用或会话已完成：整批未推进
         raise HTTPException(status_code=409, detail=exc.detail) from exc
     if payload is None:
         raise HTTPException(status_code=404, detail="会话不存在")

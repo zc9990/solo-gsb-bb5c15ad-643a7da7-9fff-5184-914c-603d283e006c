@@ -2,7 +2,9 @@
 
 切割执行会话：从已保存方案启动会话，按 (panel_no, step) 顺序逐刀推进；
 “完成当前刀”事件在单个 SQLite 写事务中完成幂等判定、版本与当前刀校验、
-状态推进和事件记录，并发/重试语义见 submit_cut_event。
+状态推进和事件记录，并发/重试语义见 submit_cut_event；设备离线后回传的
+批次事件在同一事务中先对账已应用前缀、再连续匹配后缀并一次性推进，
+语义见 submit_event_batch。
 """
 from __future__ import annotations
 
@@ -13,7 +15,7 @@ from typing import Optional
 
 from . import database as db
 from .gcode import generate_gcode, validate_plan_cuts
-from .models import CutEventRequest, GcodeRequest, PlanRequest
+from .models import CutEventRequest, EventBatchRequest, GcodeRequest, PlanRequest
 from .nesting import build_payload, solve
 
 
@@ -272,3 +274,150 @@ def submit_cut_event(session_id: str, req: CutEventRequest) -> Optional[dict]:
             conn=conn,
         )
         return state
+
+
+def _cut_ref(cut: dict) -> dict:
+    """从展平后的方案切割线提取 (panel_no, step) 标识。"""
+    return {"panel_no": cut["panel_no"], "step": cut["step"]}
+
+
+def submit_event_batch(session_id: str, req: EventBatchRequest) -> Optional[dict]:
+    """提交设备离线后回传的批次切割事件；会话不存在返回 None。
+
+    在单个 SQLite 写事务（BEGIN IMMEDIATE）中依次：
+      1. 幂等判定：同 (session_id, batch_id) 已应用且请求体一致 ->
+         原样返回首次响应；同键不同请求 -> 409 batch_id_reuse；
+      2. 对账：base_version 之后服务端已完成的区间必须与批次前缀逐项
+         一致（这些刀是设备离线前已上报过的，仅跳过）；首个不一致 ->
+         409 prefix_mismatch，整批不推进；
+      3. 其余后缀必须连续匹配当前方案的后续切刀，否则 409 cut_mismatch，
+         整批不推进；
+      4. 验证通过后一次性推进 version/completed_cuts（全部完成时置
+         completed），记录批次，一次性提交。
+
+    与单刀事件相同，BEGIN IMMEDIATE 使并发写者在库级串行：后到者读到
+    推进后的状态重新对账（一致前缀自动转为 skipped），不会重复推进。
+    """
+    request_json = db.canonical_request(req.model_dump())
+    with db.transaction() as conn:
+        row = db.get_session(session_id, conn)
+        if row is None:
+            return None
+
+        # 1) 幂等：同 batch_id 重试返回首次结果（必须先于任何状态校验）
+        batch = db.get_session_batch(session_id, req.batch_id, conn)
+        if batch is not None:
+            if batch["request_json"] != request_json:
+                raise SessionConflictError({
+                    "error": "batch_id_reuse",
+                    "message": "批次号已被本会话中的不同请求使用",
+                })
+            return json.loads(batch["response_json"])
+
+        # 2) 对账：base_version 之后已完成的区间 == 批次前缀（逐项一致）
+        version = row["version"]
+        done = row["completed_cuts"]
+        if req.base_version > version:
+            raise SessionConflictError({
+                "error": "version_conflict",
+                "message": f"base_version={req.base_version} 超过当前版本 "
+                           f"{version}，状态未推进",
+                "base_version": req.base_version,
+                "current_version": version,
+            })
+        plan = json.loads(row["plan_json"])
+        cuts = flatten_cuts(plan)
+        items = [{"panel_no": c.panel_no, "step": c.step} for c in req.cuts]
+        skipped = done - req.base_version
+        if len(items) < skipped:
+            raise SessionConflictError({
+                "error": "prefix_mismatch",
+                "message": f"批次仅 {len(items)} 刀，不足以覆盖 base_version="
+                           f"{req.base_version} 之后已完成的 {skipped} 刀，"
+                           "状态未推进",
+                "base_version": req.base_version,
+                "completed_cuts": done,
+            })
+        for i in range(skipped):
+            expected = _cut_ref(cuts[req.base_version + i])
+            if items[i] != expected:
+                raise SessionConflictError({
+                    "error": "prefix_mismatch",
+                    "message": f"批次第 {i} 项（第 {items[i]['panel_no']} 板第 "
+                               f"{items[i]['step']} 刀）与已完成的第 "
+                               f"{expected['panel_no']} 板第 {expected['step']} "
+                               "刀对账不一致，整批未推进",
+                    "index": i,
+                    "expected": expected,
+                    "received": items[i],
+                })
+
+        # 3) 后缀：从当前刀起连续匹配方案
+        suffix = items[skipped:]
+        if suffix and row["status"] == "completed":
+            raise SessionConflictError({
+                "error": "session_completed",
+                "message": f"会话已完成（共 {row['total_cuts']} 刀），批次中其余 "
+                           f"{len(suffix)} 刀无法应用",
+                "total_cuts": row["total_cuts"],
+            })
+        for j, got in enumerate(suffix):
+            idx = done + j
+            if idx >= len(cuts):
+                raise SessionConflictError({
+                    "error": "cut_mismatch",
+                    "message": f"批次第 {skipped + j} 项（第 {got['panel_no']} "
+                               f"板第 {got['step']} 刀）超出方案总刀数 "
+                               f"{len(cuts)}，整批未推进",
+                    "index": skipped + j,
+                    "expected": None,
+                    "received": got,
+                })
+            expected = _cut_ref(cuts[idx])
+            if got != expected:
+                raise SessionConflictError({
+                    "error": "cut_mismatch",
+                    "message": f"批次第 {skipped + j} 项（第 {got['panel_no']} "
+                               f"板第 {got['step']} 刀）与当前应执行的第 "
+                               f"{expected['panel_no']} 板第 {expected['step']} "
+                               "刀不一致，整批未推进",
+                    "index": skipped + j,
+                    "expected": expected,
+                    "received": got,
+                })
+
+        # 4) 一次性推进 + 记录批次，同事务提交
+        applied = len(suffix)
+        now = _now_iso()
+        new_done = done + applied
+        finished = new_done >= row["total_cuts"]
+        if applied:
+            db.update_session_progress(
+                session_id=session_id,
+                version=version + applied,
+                completed_cuts=new_done,
+                status="completed" if finished else "active",
+                updated_at=now,
+                completed_at=now if finished else None,
+                conn=conn,
+            )
+        state = _session_state(db.get_session(session_id, conn), plan)
+        response = {
+            "batch_id": req.batch_id,
+            "skipped": skipped,
+            "applied": applied,
+            "session": state,
+        }
+        db.insert_session_batch(
+            session_id=session_id,
+            batch_id=req.batch_id,
+            base_version=req.base_version,
+            cut_count=len(items),
+            skipped=skipped,
+            applied=applied,
+            request_json=request_json,
+            response_json=json.dumps(response, ensure_ascii=False),
+            created_at=now,
+            conn=conn,
+        )
+        return response

@@ -11,7 +11,8 @@
 - 保证：零件不重叠、不越界；锯缝实际占位；同输入稳定（确定性算法 + 幂等存储）；
   排不下的零件以明确原因列出；G-code 导出前逐刀几何校验，异常方案整体拒绝；
   切割执行会话持久化，逐刀事件以乐观锁版本 + 幂等键在 SQLite 事务中校验，
-  并发与重试不会破坏执行状态。
+  并发与重试不会破坏执行状态；设备离线后可通过批次接口一次性回传期间切完的
+  刀，服务端在单事务中对账已应用区间并连续推进其余刀。
 
 ---
 
@@ -361,6 +362,83 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/events \
 `detail.error` 取值：`version_conflict` / `cut_mismatch` /
 `session_completed` / `idempotency_key_reuse`。
 
+### `POST /api/v1/sessions/{session_id}/event-batches` — 离线回传批次切割事件
+
+设备离线期间继续切刀、恢复联网后一次性回传的场景：客户端以最后确认的服务端
+版本为 `base_version`，把自该版本起**按执行顺序**切完的刀整批上报。服务端在
+**单个 SQLite 写事务**中完成“对账 + 推进”：
+
+1. **对账**：`base_version` 之后服务端已完成的区间（可能来自离线前已上报的
+   单刀事件或更早批次）必须与批次**前缀**逐项一致——一致前缀仅**跳过**
+   （`skipped`），首个不一致即 `409 prefix_mismatch`，整批不推进；
+2. **推进**：其余**后缀**必须从当前刀起连续匹配方案切割序列，任一不符
+   （含超出方案总刀数）即 `409 cut_mismatch`，整批不推进；
+3. 全部验证通过后**一次性**推进 `version` 与 `completed_cuts`（推进量 =
+   `applied`），记录批次并提交；任一环节失败事务整体回滚。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `batch_id` | string, 1~128 | 批次幂等键（会话内唯一） |
+| `base_version` | integer, ≥0 | 客户端最后确认的服务端版本（对账起点），不得超过当前版本 |
+| `cuts` | array，≥1 | 自 `base_version` 起按执行顺序排列的切刀 |
+| `cuts[].panel_no` / `step` | integer, ≥1 | 刀所在母板编号 / 板内序号 |
+
+示例：会话已在 version=3（前 3 刀离线前已逐刀上报），设备离线又切了 2 刀，
+回传时客户端只确认到 version=2，于是批次从第 3 刀列起——第 3 刀对账跳过，
+第 4、5 刀推进：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/event-batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batch_id": "offline-sync-20260920-01",
+    "base_version": 2,
+    "cuts": [
+      {"panel_no": 1, "step": 3},
+      {"panel_no": 1, "step": 4},
+      {"panel_no": 1, "step": 5}
+    ]
+  }'
+```
+
+响应（`200`）：`skipped + applied` 恒等于请求中的刀数，`session` 为推进后的
+最新会话状态（结构同 `SessionResponse`）：
+
+```jsonc
+{
+  "batch_id": "offline-sync-20260920-01",
+  "skipped": 1,                  // 第 3 刀已在服务端，仅跳过
+  "applied": 2,                  // 第 4、5 刀本次推进
+  "session": {
+    "session_id": "3f8c…",
+    "status": "active",
+    "version": 5,                // 一次性 +2
+    "completed_cuts": 5,
+    "total_cuts": 20,
+    "current_panel": 1,
+    "next_cut": {"panel_no": 1, "step": 6, "axis": "H", "…": "…"}
+  }
+}
+```
+
+幂等与冲突语义（与单刀事件一致，键为 `batch_id`）：
+
+- **同键同请求重试**：原样返回首次响应（HTTP `200`，逐字段一致），状态不重复
+  推进；验证失败的批次不落库，修正后可用同一 `batch_id` 重新提交；
+- **同键不同请求**：`409 batch_id_reuse`；
+- **`base_version` 超过当前版本**：`409 version_conflict`；
+- **批次短于对账区间**（`base_version` 之后已完成的刀数多于批次项数）：
+  `409 prefix_mismatch`；
+- **会话已完成仍带新刀**：`409 session_completed`；纯对账批次（全部已在已
+  完成区间，`applied=0`）在已完成会话上依然成功；
+- 会话不存在 `404`。
+
+并发下良构批次（自 `base_version` 起与方案一致）天然安全：写锁串行化后，
+先到者推进，后到者读到推进后的版本，其前缀自动转为对账跳过——同一批复传
+多少次、与多少并发批次竞争，推进总量都恰好等于实际切刀数。
+
 ### `GET /health`
 
 返回 `{"status":"ok"}`，供容器健康检查与负载均衡探活。
@@ -430,4 +508,7 @@ python3 -m unittest discover -s tests -v
 结果稳定性（含输入乱序）、SQLite 幂等存取、**G-code 坐标变换/确定性/行号映射/
 总长/导出前校验**、**切割会话的启动/查询/逐刀推进/零切割即完成、幂等重试原样
 返回、同键冲突、旧版本与跳步拒绝、多线程并发竞争（同版本唯一胜者、同键全员
-重放、带重试跑完整个会话）**，以及基于 TestClient 的 HTTP 端到端。
+重放、带重试跑完整个会话）**、**离线批次回传的前缀对账/后缀连续匹配/一次性
+推进、失败整批回滚不留痕、批次幂等重放与同键异请求 409、并发批次竞争
+（推进总量守恒、同批次号全员重放、多线程浸泡跑完会话）**，以及基于
+TestClient 的 HTTP 端到端。
